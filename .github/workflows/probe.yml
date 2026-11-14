@@ -31,45 +31,43 @@ jobs:
           clang -framework Carbon -o /tmp/reg /tmp/reg.c
           sudo /tmp/reg "/Library/Input Methods/WeType.app"
 
-      - name: lldb dump platform
+      - name: lldb dump business task bodies
         run: |
           set -x
+          rm -f /tmp/macreq_*.bin
           cat > /tmp/hook.py <<'PY'
           import lldb
-          def rd(p, a, n):
-              e = lldb.SBError()
-              d = p.ReadMemory(a, n, e)
-              return d if d else b''
-          def dump():
-              f = lldb.frame
-              p = f.GetThread().GetProcess()
-              this = f.FindRegister('x0').GetValueAsUnsigned()
-              ctx = int.from_bytes(rd(p, this + 0xf0, 8), 'little')
-              plat = int.from_bytes(rd(p, ctx + 0x80, 4), 'little')
-              print('PLATFORM_INT', plat, flush=True)
-              print('THIS', hex(this), 'CTX', hex(ctx), flush=True)
-              print('CTX60', rd(p, ctx + 0x60, 0x40).hex(), flush=True)
+          _n = 0
+          def bt(frame, bp_loc, internal):
+              global _n
+              try:
+                  p = frame.GetThread().GetProcess()
+                  cmd = frame.FindRegister("x0").GetValueAsUnsigned()
+                  sub = frame.FindRegister("x1").GetValueAsUnsigned()
+                  body = frame.FindRegister("x2").GetValueAsUnsigned()
+                  ln = frame.FindRegister("x3").GetValueAsUnsigned()
+                  print("TASK", cmd, sub, ln, flush=True)
+                  if 0 < ln < 8000000:
+                      e = lldb.SBError()
+                      d = p.ReadMemory(body, ln, e)
+                      if d:
+                          open("/tmp/macreq_%d_%d_%d.bin" % (cmd, sub, _n), "wb").write(d)
+                          _n += 1
+              except Exception as ex:
+                  print("ERR", repr(ex), flush=True)
+              return False
           PY
           ( lldb -b \
               -o "target create \"/Library/Input Methods/WeType.app/Contents/MacOS/WeType\"" \
-              -o "breakpoint set -n _ZN5wetap3net16CronetNetworkApi15GetSvrPublicKeyEhb" \
-              -o "process launch" \
               -o "command script import /tmp/hook.py" \
-              -o "script import hook; hook.dump()" \
-              -o "process kill" > /tmp/lldb.log 2>&1 & echo $! > /tmp/lldb.pid )
-          sleep 50
+              -o "breakpoint set -n _business_net_start_task_with_option" \
+              -o "breakpoint command add -s python -F hook.bt 1" \
+              -o "process launch" > /tmp/lldb.log 2>&1 & echo $! > /tmp/lldb.pid )
+          sleep 70
           kill $(cat /tmp/lldb.pid) 2>/dev/null || true
-          sleep 1
-          echo "=== lldb.log ==="
-          cat /tmp/lldb.log | head -80
-
-      - name: Tokens / config
-        if: always()
-        run: |
-          defaults read com.tencent.inputmethod.wetype 2>&1 | head -60 || true
-          echo "=== device code strings ==="
-          find "$HOME/Library/Application Support/WeType" -type f -size -2M 2>/dev/null | while read f; do strings "$f"; done | grep -aE "^(MAC|AND|WIN|IOS|HAR)[0-9A-Za-z]{20,}" | sort -u | head -10 || true
-          tar -czf /tmp/appsupport.tgz -C "$HOME/Library/Application Support" WeType 2>/dev/null || true
+          sleep 2
+          echo "=== tasks:"; grep -aE "^TASK|ERR|Breakpoint" /tmp/lldb.log | head -60
+          ls -la /tmp/macreq_*.bin 2>/dev/null | head -20
 
       - name: Upload
         if: always()
@@ -78,5 +76,5 @@ jobs:
           name: probe-${{ github.run_id }}
           path: |
             /tmp/lldb.log
-            /tmp/appsupport.tgz
+            /tmp/macreq_*.bin
           if-no-files-found: warn
