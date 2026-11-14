@@ -60,8 +60,11 @@ jobs:
           ( lldb -b \
               -o "target create \"/Library/Input Methods/WeType.app/Contents/MacOS/WeType\"" \
               -o "command script import /tmp/hook.py" \
+              -o "breakpoint set -n _net_start_task_with_option_v2" \
+              -o "breakpoint set -n business_net_start_task_with_option" \
               -o "breakpoint set -n _business_net_start_task_with_option" \
-              -o "breakpoint command add -s python -F hook.bt 1" \
+              -o "breakpoint command add -s python -F hook.bt 1 2 3" \
+              -o "breakpoint list" \
               -o "process launch" > /tmp/lldb.log 2>&1 & echo $! > /tmp/lldb.pid )
           sleep 70
           kill $(cat /tmp/lldb.pid) 2>/dev/null || true
