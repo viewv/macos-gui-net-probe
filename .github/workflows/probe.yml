@@ -31,33 +31,48 @@ jobs:
           clang -framework Carbon -o /tmp/reg /tmp/reg.c
           sudo /tmp/reg "/Library/Input Methods/WeType.app"
 
-      - name: Run directly and capture stderr
+      - name: lldb read platform
         run: |
           set -x
-          sudo tcpdump -i en0 -s 512 -c 20000 -w /tmp/app.pcap 'host wetype.weixin.qq.com or tcp port 443' > /tmp/tcpdump.log 2>&1 &
-          "/Library/Input Methods/WeType.app/Contents/MacOS/WeType" > /tmp/app.out 2>&1 &
-          APP=$!
-          echo "pid=$APP"
-          sleep 75
-          pgrep -lf "WeType.app/Contents/MacOS/WeType" || true
-          echo "=== platform / wss / uin lines ==="
-          grep -aE "platform|os_type|device_code|GetSvrPublicKey|get dh|get Uin|change_uin|business_initialize|net_initialize|cmd_id|5003|crash|cronet" /tmp/app.out | tail -120 || true
-          echo "=== full tail ==="
-          tail -120 /tmp/app.out || true
+          cat > /tmp/hook.py <<'PY'
+          import lldb
+          def _rd(proc, addr, n):
+              err = lldb.SBError()
+              d = proc.ReadMemory(addr, n, err)
+              return d if d else b''
+          def cb(frame, bp_loc, internal):
+              try:
+                  proc = frame.GetThread().GetProcess()
+                  this = frame.FindRegister("x0").GetValueAsUnsigned()
+                  ctx = int.from_bytes(_rd(proc, this + 0xf0, 8), 'little')
+                  plat = int.from_bytes(_rd(proc, ctx + 0x80, 4), 'little')
+                  print("PLATFORM_INT", plat, flush=True)
+                  print("CTX_60", _rd(proc, ctx + 0x60, 0x40).hex(), flush=True)
+                  print("THIS", hex(this), "CTX", hex(ctx), flush=True)
+              except Exception as e:
+                  print("HOOKERR", repr(e), flush=True)
+              return False
+          t = lldb.debugger.GetSelectedTarget()
+          bp = t.BreakpointCreateByName("__ZN5wetap3net16CronetNetworkApi15GetSvrPublicKeyEhb")
+          print("BP_LOCS", bp.GetNumLocations(), flush=True)
+          bp.SetScriptCallbackFunction("hook.cb")
+          PY
+          ( lldb -b \
+              -o "target create \"/Library/Input Methods/WeType.app/Contents/MacOS/WeType\"" \
+              -o "command script import /tmp/hook.py" \
+              -o "process launch" > /tmp/lldb.log 2>&1 & echo $! > /tmp/lldb.pid )
+          sleep 50
+          kill $(cat /tmp/lldb.pid) 2>/dev/null || true
+          sleep 2
+          echo "=== lldb.log ==="
+          grep -aE "PLATFORM_INT|CTX_60|BP_LOCS|THIS|HOOKERR|error:|wxime_initialize|cronet|wss" /tmp/lldb.log | head -40
+          echo "=== raw ==="
+          head -60 /tmp/lldb.log
 
-      - name: Dump tokens / config
+      - name: Tokens
         if: always()
         run: |
-          set -x
-          defaults read com.tencent.inputmethod.wetype 2>&1 | head -80 || true
-          echo "=== device code strings ==="
-          find "$HOME/Library/Application Support/WeType" -type f -size -2M 2>/dev/null | while read f; do strings "$f"; done | grep -aE "^(MAC|AND|WIN|IOS|HAR)[0-9A-Za-z]{20,}" | sort -u | head -20 || true
-          echo "=== business tokens ==="
           ls -la "$HOME/Library/Application Support/WeType/business/ddd/2" 2>/dev/null || true
-
-      - name: Collect
-        if: always()
-        run: |
           tar -czf /tmp/appsupport.tgz -C "$HOME/Library/Application Support" WeType 2>/dev/null || true
 
       - name: Upload
@@ -66,7 +81,6 @@ jobs:
         with:
           name: probe-${{ github.run_id }}
           path: |
-            /tmp/app.out
-            /tmp/app.pcap
+            /tmp/lldb.log
             /tmp/appsupport.tgz
           if-no-files-found: warn
