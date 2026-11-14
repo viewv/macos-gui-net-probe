@@ -1,0 +1,92 @@
+name: probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15          # Apple silicon; 用 macos-13 可测 Intel
+    timeout-minutes: 25
+    steps:
+      - name: Environment / GUI session
+        run: |
+          set -x
+          sw_vers
+          uname -m
+          arch
+          id
+          echo "mgr=$(launchctl managername 2>&1)"
+          echo "console=$(stat -f%Su /dev/console 2>&1)"
+          ps ax -o pid,comm | egrep 'WindowServer|loginwindow|Dock' || true
+          launchctl print gui/$(id -u) 2>&1 | head -20 || true
+
+      - name: GUI launch test
+        run: |
+          set -x
+          open -a TextEdit || true
+          sleep 3
+          pgrep -x TextEdit && echo TEXTEDIT_OK || echo TEXTEDIT_FAIL
+          screencapture -x /tmp/shot.png || echo SCREENCAP_FAIL
+          ls -la /tmp/shot.png || true
+
+      - name: Download app (official URL, not committed)
+        run: |
+          set -x
+          curl -fL --retry 3 -o /tmp/app.zip "https://download.weread.qq.com/app/wxkb/mac/3.0.1/WeType_3.0.1_684.zip"
+          unzip -q /tmp/app.zip -d /tmp/app
+          ls -la /tmp/app
+
+      - name: Install
+        run: |
+          set -x
+          sudo cp -R "/tmp/app/WeType.app" /Applications/
+          sudo xattr -dr com.apple.quarantine /Applications/WeType.app || true
+          sudo spctl --master-disable || true
+          codesign -dv /Applications/WeType.app 2>&1 | head -10 || true
+
+      - name: Run and capture
+        run: |
+          set -x
+          sudo tcpdump -i en0 -s 512 -c 5000 -w /tmp/app.pcap 'host wetype.weixin.qq.com or tcp port 443' > /tmp/tcpdump.log 2>&1 &
+          log stream --style compact --predicate 'process CONTAINS[c] "WeType"' > /tmp/logstream.txt 2>&1 &
+          sleep 2
+          /Applications/WeType.app/Contents/MacOS/WeType > /tmp/app.out 2>&1 &
+          APP_PID=$!
+          echo "direct pid=$APP_PID"
+          sleep 30
+          if ! pgrep -f "WeType.app/Contents/MacOS/WeType" >/dev/null; then
+            echo "direct exec exited; trying open -n"
+            open -n /Applications/WeType.app || true
+          fi
+          sleep 60
+          echo "=== processes ==="
+          pgrep -lf WeType || true
+          ps -p $APP_PID -o pid,etime,stat,command || true
+          echo "=== app.out (first 200 lines) ==="
+          head -200 /tmp/app.out || true
+          echo "=== keyword grep ==="
+          grep -aE "platform|os_type|device|dh|uin|business|net_initialize|cmd_id|5003" /tmp/app.out | tail -100 || true
+
+      - name: Collect logs
+        if: always()
+        run: |
+          log show --last 10m --style compact --predicate 'process CONTAINS[c] "WeType"' > /tmp/logshow.txt 2>&1 || true
+          grep -aE "platform|os_type|device|dh|uin|business|net_initialize|cmd_id|5003" /tmp/logshow.txt | tail -100 > /tmp/logshow_grep.txt || true
+          grep -aE "platform|os_type|device|dh|uin|business|net_initialize|cmd_id|5003" /tmp/logstream.txt | tail -100 > /tmp/logstream_grep.txt || true
+          ls -la ~/Library/Logs "$HOME/Library/Application Support" 2>/dev/null | head -80 || true
+          find "$HOME/Library" -maxdepth 5 \( -iname "*wetype*" -o -iname "*wxkb*" \) 2>/dev/null | head -50 || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ github.run_id }}
+          path: |
+            /tmp/app.out
+            /tmp/app.pcap
+            /tmp/tcpdump.log
+            /tmp/logstream.txt
+            /tmp/logstream_grep.txt
+            /tmp/logshow.txt
+            /tmp/logshow_grep.txt
+            /tmp/shot.png
+          if-no-files-found: warn
