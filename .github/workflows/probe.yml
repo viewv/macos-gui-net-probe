@@ -53,9 +53,15 @@ jobs:
                   print("HOOKERR", repr(e), flush=True)
               return False
           t = lldb.debugger.GetSelectedTarget()
-          bp = t.BreakpointCreateByName("__ZN5wetap3net16CronetNetworkApi15GetSvrPublicKeyEhb")
-          print("BP_LOCS", bp.GetNumLocations(), flush=True)
+          for nm in ["wetap::net::CronetNetworkApi::GetSvrPublicKey(bool, bool)",
+                     "__ZN5wetap3net16CronetNetworkApi15GetSvrPublicKeyEhb",
+                     "_ZN5wetap3net16CronetNetworkApi15GetSvrPublicKeyEhb"]:
+              b = t.BreakpointCreateByName(nm)
+              print("BP", nm, b.GetNumLocations(), flush=True)
+          bp = t.BreakpointCreateByRegex("GetSvrPublicKey")
+          print("BP_REGEX", bp.GetNumLocations(), flush=True)
           bp.SetScriptCallbackFunction("hook.cb")
+          print("FUNCS", len(t.FindFunctions("GetSvrPublicKey", lldb.eFunctionNameTypeAny)), flush=True)
           PY
           ( lldb -b \
               -o "target create \"/Library/Input Methods/WeType.app/Contents/MacOS/WeType\"" \
