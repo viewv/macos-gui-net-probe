@@ -7,115 +7,87 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 25
     steps:
-      - name: Environment / GUI session
-        run: |
-          set -x
-          sw_vers
-          uname -m
-          echo "mgr=$(launchctl managername 2>&1)"
-          echo "console=$(stat -f%Su /dev/console 2>&1)"
-          pgrep -x WindowServer && echo WindowServer=yes || echo WindowServer=no
-
-      - name: Download app
-        run: |
-          set -x
-          curl -fL --retry 3 -o /tmp/app.zip "https://download.weread.qq.com/app/wxkb/mac/3.0.1/WeType_3.0.1_684.zip"
-          rm -rf /tmp/app && mkdir -p /tmp/app
-          unzip -q /tmp/app.zip -d /tmp/app
-          ls -la /tmp/app
-
       - name: Install as input method + register
         run: |
           set -x
+          curl -fL --retry 3 -o /tmp/app.zip "https://download.weread.qq.com/app/wxkb/mac/3.0.1/WeType_3.0.1_684.zip"
+          rm -rf /tmp/app && mkdir -p /tmp/app && unzip -q /tmp/app.zip -d /tmp/app
           sudo mkdir -p "/Library/Input Methods"
           sudo rm -rf "/Library/Input Methods/WeType.app"
           sudo cp -R "/tmp/app/WeType.app" "/Library/Input Methods/"
           sudo chown -R root:wheel "/Library/Input Methods/WeType.app"
           sudo xattr -dr com.apple.quarantine "/Library/Input Methods/WeType.app" || true
           sudo spctl --master-disable || true
-
           cat > /tmp/reg.c <<'EOF'
           #include <Carbon/Carbon.h>
           #include <stdio.h>
           #include <string.h>
           int main(int argc, char **argv) {
             CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8*)argv[1], strlen(argv[1]), true);
-            OSStatus s = TISRegisterInputSource(u);
-            printf("TISRegisterInputSource=%d\n", (int)s);
-            CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            CFDictionaryAddValue(d, kTISPropertyBundleID, CFSTR("com.tencent.inputmethod.wetype"));
-            CFArrayRef a = TISCreateInputSourceList(d, false);
-            CFIndex n = a ? CFArrayGetCount(a) : 0;
-            printf("input sources=%ld\n", (long)n);
-            for (CFIndex i = 0; i < n; i++) {
-              TISInputSourceRef src = (TISInputSourceRef)CFArrayGetValueAtIndex(a, i);
-              CFStringRef sid = (CFStringRef)TISGetInputSourceProperty(src, kTISPropertyInputSourceID);
-              char buf[256] = {0};
-              if (sid) CFStringGetCString(sid, buf, sizeof(buf), kCFStringEncodingUTF8);
-              printf("  enable %s -> %d\n", buf, (int)TISEnableInputSource(src));
-            }
+            printf("reg=%d\n", (int)TISRegisterInputSource(u));
             return 0;
           }
           EOF
           clang -framework Carbon -o /tmp/reg /tmp/reg.c
           sudo /tmp/reg "/Library/Input Methods/WeType.app"
 
-      - name: Run and capture
+      - name: lldb platform probe
         run: |
           set -x
-          sudo tcpdump -i en0 -s 512 -c 20000 -w /tmp/app.pcap 'host wetype.weixin.qq.com or tcp port 443' > /tmp/tcpdump.log 2>&1 &
-          log stream --style compact --predicate 'process CONTAINS[c] "WeType"' > /tmp/logstream.txt 2>&1 &
-          sleep 2
-          open -a "/Library/Input Methods/WeType.app" || true
-          sleep 20
-          pgrep -lf WeType || true
-          # 尝试把输入源切到 WeType（会触发输入法连接 / 引擎初始化）
-          cat > /tmp/sel.c <<'EOF'
-          #include <Carbon/Carbon.h>
-          #include <stdio.h>
-          int main(void) {
-            CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            CFDictionaryAddValue(d, kTISPropertyBundleID, CFSTR("com.tencent.inputmethod.wetype"));
-            CFArrayRef a = TISCreateInputSourceList(d, false);
-            CFIndex n = a ? CFArrayGetCount(a) : 0;
-            printf("select: %ld sources\n", (long)n);
-            if (n > 0) {
-              TISInputSourceRef src = (TISInputSourceRef)CFArrayGetValueAtIndex(a, 0);
-              printf("select rc=%d\n", (int)TISSelectInputSource(src));
-            }
-            return 0;
-          }
-          EOF
-          clang -framework Carbon -o /tmp/sel /tmp/sel.c && /tmp/sel || true
-          sleep 70
-          pgrep -lf WeType || true
-          echo "=== app support files ==="
-          find "$HOME/Library/Application Support/WeType" -maxdepth 3 -type f -print 2>/dev/null | head -50
-          echo "=== app support dirs ==="
-          find "$HOME/Library/Application Support/WeType" -maxdepth 3 -print 2>/dev/null | head -50
-          echo "=== possible logs ==="
-          for f in $(find "$HOME/Library/Application Support/WeType" "$HOME/Library/Logs" -maxdepth 4 -type f \( -name "*.log" -o -name "*.txt" \) 2>/dev/null | head -10); do
-            echo "--- $f"; tail -80 "$f" 2>/dev/null
-          done
-          echo "=== keyword grep (logstream) ==="
-          grep -aE "platform|os_type|device|dh|uin|business|net_initialize|cmd_id|5003|Module" /tmp/logstream.txt | tail -120 || true
+          cat > /tmp/hook.py <<'PY'
+          import lldb
+          def _rd(proc, addr, n):
+              err = lldb.SBError()
+              d = proc.ReadMemory(addr, n, err)
+              return d if d else b''
+          def cb(frame, bp_loc, internal):
+              try:
+                  proc = frame.GetThread().GetProcess()
+                  this = frame.FindRegister("x0").GetValueAsUnsigned()
+                  ctx = int.from_bytes(_rd(proc, this + 0xf0, 8), 'little')
+                  plat = int.from_bytes(_rd(proc, ctx + 0x80, 4), 'little')
+                  print("PLATFORM_INT", plat, flush=True)
+                  print("CTX_HEX", _rd(proc, ctx + 0x60, 0x40).hex(), flush=True)
+              except Exception as e:
+                  print("HOOKERR", e, flush=True)
+              return False
+          def setup(debugger, command, result, internal_dict):
+              t = debugger.GetSelectedTarget()
+              bp = t.BreakpointCreateByName("__ZN5wetap3net16CronetNetworkApi15GetSvrPublicKeyEhb")
+              print("BP_LOCS", bp.GetNumLocations(), flush=True)
+              bp.SetScriptCallbackFunction("hook.cb")
+          PY
+          timeout 60 lldb -b \
+            -o "target create \"/Library/Input Methods/WeType.app/Contents/MacOS/WeType\"" \
+            -o "command script import /tmp/hook.py" \
+            -o "script setup(lldb.debugger, '', None, None)" \
+            -o "process launch" \
+            -o "continue" > /tmp/lldb.log 2>&1 || true
+          sleep 5
+          echo "=== lldb.log ==="
+          head -100 /tmp/lldb.log
 
-      - name: Collect + upload
+      - name: Config / device code dump
         if: always()
         run: |
-          log show --last 10m --style compact --predicate 'process CONTAINS[c] "WeType"' > /tmp/logshow.txt 2>&1 || true
-          tar -czf /tmp/appsupport.tgz -C "$HOME/Library/Application Support" WeType 2>/dev/null || true
-          true
+          set -x
+          defaults read com.tencent.inputmethod.wetype 2>&1 | head -100 || true
+          echo "=== strings in app support ==="
+          find "$HOME/Library/Application Support/WeType" -type f -size -2M 2>/dev/null | while read f; do strings "$f"; done | grep -aE "^(MAC|AND|WIN|IOS|HAR)[0-9A-Za-z]{20,}" | sort -u | head -20 || true
+          echo "=== tokens ==="
+          ls -la "$HOME/Library/Application Support/WeType/business/ddd/2" 2>/dev/null || true
 
-      - name: Upload artifacts
+      - name: Collect
+        if: always()
+        run: |
+          tar -czf /tmp/appsupport.tgz -C "$HOME/Library/Application Support" WeType 2>/dev/null || true
+
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: probe-${{ github.run_id }}
           path: |
-            /tmp/app.pcap
-            /tmp/tcpdump.log
-            /tmp/logstream.txt
-            /tmp/logshow.txt
+            /tmp/lldb.log
             /tmp/appsupport.tgz
           if-no-files-found: warn
