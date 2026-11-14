@@ -57,13 +57,15 @@ jobs:
               print("BP_LOCS", bp.GetNumLocations(), flush=True)
               bp.SetScriptCallbackFunction("hook.cb")
           PY
-          timeout 60 lldb -b \
+          ( lldb -b \
             -o "target create \"/Library/Input Methods/WeType.app/Contents/MacOS/WeType\"" \
             -o "command script import /tmp/hook.py" \
             -o "script setup(lldb.debugger, '', None, None)" \
             -o "process launch" \
-            -o "continue" > /tmp/lldb.log 2>&1 || true
-          sleep 5
+            -o "continue" > /tmp/lldb.log 2>&1 & echo $! > /tmp/lldb.pid )
+          sleep 45
+          kill $(cat /tmp/lldb.pid) 2>/dev/null || true
+          sleep 2
           echo "=== lldb.log ==="
           head -100 /tmp/lldb.log
 
