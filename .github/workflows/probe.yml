@@ -47,6 +47,11 @@ jobs:
                   body = frame.FindRegister("x2").GetValueAsUnsigned()
                   ln = frame.FindRegister("x3").GetValueAsUnsigned()
                   print("TASK", cmd, sub, ln, flush=True)
+                  if cmd == 4814 and sub == 5:
+                      opt = frame.FindRegister("x6").GetValueAsUnsigned()
+                      e = lldb.SBError()
+                      od = p.ReadMemory(opt, 32, e)
+                      print("OPT", hex(opt), od.hex() if od else "?", flush=True)
                   if 0 < ln < 8000000:
                       e = lldb.SBError()
                       d = p.ReadMemory(body, ln, e)
