@@ -4,7 +4,7 @@ on:
 
 jobs:
   probe:
-    runs-on: macos-15          # Apple silicon; 用 macos-13 可测 Intel
+    runs-on: macos-15
     timeout-minutes: 25
     steps:
       - name: Environment / GUI session
@@ -12,68 +12,100 @@ jobs:
           set -x
           sw_vers
           uname -m
-          arch
-          id
           echo "mgr=$(launchctl managername 2>&1)"
           echo "console=$(stat -f%Su /dev/console 2>&1)"
-          ps ax -o pid,comm | egrep 'WindowServer|loginwindow|Dock' || true
-          launchctl print gui/$(id -u) 2>&1 | head -20 || true
+          pgrep -x WindowServer && echo WindowServer=yes || echo WindowServer=no
 
-      - name: GUI launch test
-        run: |
-          set -x
-          open -a TextEdit || true
-          sleep 3
-          pgrep -x TextEdit && echo TEXTEDIT_OK || echo TEXTEDIT_FAIL
-          screencapture -x /tmp/shot.png || echo SCREENCAP_FAIL
-          ls -la /tmp/shot.png || true
-
-      - name: Download app (official URL, not committed)
+      - name: Download app
         run: |
           set -x
           curl -fL --retry 3 -o /tmp/app.zip "https://download.weread.qq.com/app/wxkb/mac/3.0.1/WeType_3.0.1_684.zip"
+          rm -rf /tmp/app && mkdir -p /tmp/app
           unzip -q /tmp/app.zip -d /tmp/app
           ls -la /tmp/app
 
-      - name: Install
+      - name: Install as input method + register
         run: |
           set -x
-          sudo cp -R "/tmp/app/WeType.app" /Applications/
-          sudo xattr -dr com.apple.quarantine /Applications/WeType.app || true
+          sudo mkdir -p "/Library/Input Methods"
+          sudo rm -rf "/Library/Input Methods/WeType.app"
+          sudo cp -R "/tmp/app/WeType.app" "/Library/Input Methods/"
+          sudo chown -R root:wheel "/Library/Input Methods/WeType.app"
+          sudo xattr -dr com.apple.quarantine "/Library/Input Methods/WeType.app" || true
           sudo spctl --master-disable || true
-          codesign -dv /Applications/WeType.app 2>&1 | head -10 || true
+
+          cat > /tmp/reg.c <<'EOF'
+          #include <Carbon/Carbon.h>
+          #include <stdio.h>
+          #include <string.h>
+          int main(int argc, char **argv) {
+            CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8*)argv[1], strlen(argv[1]), true);
+            OSStatus s = TISRegisterInputSource(u);
+            printf("TISRegisterInputSource=%d\n", (int)s);
+            CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            CFDictionaryAddValue(d, kTISPropertyBundleID, CFSTR("com.tencent.inputmethod.wetype"));
+            CFArrayRef a = TISCreateInputSourceList(d, false);
+            CFIndex n = a ? CFArrayGetCount(a) : 0;
+            printf("input sources=%ld\n", (long)n);
+            for (CFIndex i = 0; i < n; i++) {
+              TISInputSourceRef src = (TISInputSourceRef)CFArrayGetValueAtIndex(a, i);
+              CFStringRef sid = (CFStringRef)TISGetInputSourceProperty(src, kTISPropertyInputSourceID);
+              char buf[256] = {0};
+              if (sid) CFStringGetCString(sid, buf, sizeof(buf), kCFStringEncodingUTF8);
+              printf("  enable %s -> %d\n", buf, (int)TISEnableInputSource(src));
+            }
+            return 0;
+          }
+          EOF
+          clang -framework Carbon -o /tmp/reg /tmp/reg.c
+          sudo /tmp/reg "/Library/Input Methods/WeType.app"
 
       - name: Run and capture
         run: |
           set -x
-          sudo tcpdump -i en0 -s 512 -c 5000 -w /tmp/app.pcap 'host wetype.weixin.qq.com or tcp port 443' > /tmp/tcpdump.log 2>&1 &
+          sudo tcpdump -i en0 -s 512 -c 20000 -w /tmp/app.pcap 'host wetype.weixin.qq.com or tcp port 443' > /tmp/tcpdump.log 2>&1 &
           log stream --style compact --predicate 'process CONTAINS[c] "WeType"' > /tmp/logstream.txt 2>&1 &
           sleep 2
-          /Applications/WeType.app/Contents/MacOS/WeType > /tmp/app.out 2>&1 &
-          APP_PID=$!
-          echo "direct pid=$APP_PID"
-          sleep 30
-          if ! pgrep -f "WeType.app/Contents/MacOS/WeType" >/dev/null; then
-            echo "direct exec exited; trying open -n"
-            open -n /Applications/WeType.app || true
-          fi
-          sleep 60
-          echo "=== processes ==="
+          open -a "/Library/Input Methods/WeType.app" || true
+          sleep 20
           pgrep -lf WeType || true
-          ps -p $APP_PID -o pid,etime,stat,command || true
-          echo "=== app.out (first 200 lines) ==="
-          head -200 /tmp/app.out || true
-          echo "=== keyword grep ==="
-          grep -aE "platform|os_type|device|dh|uin|business|net_initialize|cmd_id|5003" /tmp/app.out | tail -100 || true
+          # 尝试把输入源切到 WeType（会触发输入法连接 / 引擎初始化）
+          cat > /tmp/sel.c <<'EOF'
+          #include <Carbon/Carbon.h>
+          #include <stdio.h>
+          int main(void) {
+            CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            CFDictionaryAddValue(d, kTISPropertyBundleID, CFSTR("com.tencent.inputmethod.wetype"));
+            CFArrayRef a = TISCreateInputSourceList(d, false);
+            CFIndex n = a ? CFArrayGetCount(a) : 0;
+            printf("select: %ld sources\n", (long)n);
+            if (n > 0) {
+              TISInputSourceRef src = (TISInputSourceRef)CFArrayGetValueAtIndex(a, 0);
+              printf("select rc=%d\n", (int)TISSelectInputSource(src));
+            }
+            return 0;
+          }
+          EOF
+          clang -framework Carbon -o /tmp/sel /tmp/sel.c && /tmp/sel || true
+          sleep 70
+          pgrep -lf WeType || true
+          echo "=== app support files ==="
+          find "$HOME/Library/Application Support/WeType" -maxdepth 3 -type f -print 2>/dev/null | head -50
+          echo "=== app support dirs ==="
+          find "$HOME/Library/Application Support/WeType" -maxdepth 3 -print 2>/dev/null | head -50
+          echo "=== possible logs ==="
+          for f in $(find "$HOME/Library/Application Support/WeType" "$HOME/Library/Logs" -maxdepth 4 -type f \( -name "*.log" -o -name "*.txt" \) 2>/dev/null | head -10); do
+            echo "--- $f"; tail -80 "$f" 2>/dev/null
+          done
+          echo "=== keyword grep (logstream) ==="
+          grep -aE "platform|os_type|device|dh|uin|business|net_initialize|cmd_id|5003|Module" /tmp/logstream.txt | tail -120 || true
 
-      - name: Collect logs
+      - name: Collect + upload
         if: always()
         run: |
           log show --last 10m --style compact --predicate 'process CONTAINS[c] "WeType"' > /tmp/logshow.txt 2>&1 || true
-          grep -aE "platform|os_type|device|dh|uin|business|net_initialize|cmd_id|5003" /tmp/logshow.txt | tail -100 > /tmp/logshow_grep.txt || true
-          grep -aE "platform|os_type|device|dh|uin|business|net_initialize|cmd_id|5003" /tmp/logstream.txt | tail -100 > /tmp/logstream_grep.txt || true
-          ls -la ~/Library/Logs "$HOME/Library/Application Support" 2>/dev/null | head -80 || true
-          find "$HOME/Library" -maxdepth 5 \( -iname "*wetype*" -o -iname "*wxkb*" \) 2>/dev/null | head -50 || true
+          tar -czf /tmp/appsupport.tgz -C "$HOME/Library/Application Support" WeType 2>/dev/null || true
+          true
 
       - name: Upload artifacts
         if: always()
@@ -81,12 +113,9 @@ jobs:
         with:
           name: probe-${{ github.run_id }}
           path: |
-            /tmp/app.out
             /tmp/app.pcap
             /tmp/tcpdump.log
             /tmp/logstream.txt
-            /tmp/logstream_grep.txt
             /tmp/logshow.txt
-            /tmp/logshow_grep.txt
-            /tmp/shot.png
+            /tmp/appsupport.tgz
           if-no-files-found: warn
