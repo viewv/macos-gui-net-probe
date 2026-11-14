@@ -31,54 +31,44 @@ jobs:
           clang -framework Carbon -o /tmp/reg /tmp/reg.c
           sudo /tmp/reg "/Library/Input Methods/WeType.app"
 
-      - name: lldb read platform
+      - name: lldb dump platform
         run: |
           set -x
           cat > /tmp/hook.py <<'PY'
           import lldb
-          def _rd(proc, addr, n):
-              err = lldb.SBError()
-              d = proc.ReadMemory(addr, n, err)
+          def rd(p, a, n):
+              e = lldb.SBError()
+              d = p.ReadMemory(a, n, e)
               return d if d else b''
-          def cb(frame, bp_loc, internal):
-              try:
-                  proc = frame.GetThread().GetProcess()
-                  this = frame.FindRegister("x0").GetValueAsUnsigned()
-                  ctx = int.from_bytes(_rd(proc, this + 0xf0, 8), 'little')
-                  plat = int.from_bytes(_rd(proc, ctx + 0x80, 4), 'little')
-                  print("PLATFORM_INT", plat, flush=True)
-                  print("CTX_60", _rd(proc, ctx + 0x60, 0x40).hex(), flush=True)
-                  print("THIS", hex(this), "CTX", hex(ctx), flush=True)
-              except Exception as e:
-                  print("HOOKERR", repr(e), flush=True)
-              return False
-          t = lldb.debugger.GetSelectedTarget()
-          for nm in ["wetap::net::CronetNetworkApi::GetSvrPublicKey(bool, bool)",
-                     "__ZN5wetap3net16CronetNetworkApi15GetSvrPublicKeyEhb",
-                     "_ZN5wetap3net16CronetNetworkApi15GetSvrPublicKeyEhb"]:
-              b = t.BreakpointCreateByName(nm)
-              print("BP", nm, b.GetNumLocations(), flush=True)
-          bp = t.BreakpointCreateByRegex("GetSvrPublicKey")
-          print("BP_REGEX", bp.GetNumLocations(), flush=True)
-          bp.SetScriptCallbackFunction("hook.cb")
-          print("FUNCS", len(t.FindFunctions("GetSvrPublicKey", lldb.eFunctionNameTypeAny)), flush=True)
+          def dump():
+              f = lldb.frame
+              p = f.GetThread().GetProcess()
+              this = f.FindRegister('x0').GetValueAsUnsigned()
+              ctx = int.from_bytes(rd(p, this + 0xf0, 8), 'little')
+              plat = int.from_bytes(rd(p, ctx + 0x80, 4), 'little')
+              print('PLATFORM_INT', plat, flush=True)
+              print('THIS', hex(this), 'CTX', hex(ctx), flush=True)
+              print('CTX60', rd(p, ctx + 0x60, 0x40).hex(), flush=True)
           PY
           ( lldb -b \
               -o "target create \"/Library/Input Methods/WeType.app/Contents/MacOS/WeType\"" \
+              -o "breakpoint set -n _ZN5wetap3net16CronetNetworkApi15GetSvrPublicKeyEhb" \
+              -o "process launch" \
               -o "command script import /tmp/hook.py" \
-              -o "process launch" > /tmp/lldb.log 2>&1 & echo $! > /tmp/lldb.pid )
+              -o "script import hook; hook.dump()" \
+              -o "process kill" > /tmp/lldb.log 2>&1 & echo $! > /tmp/lldb.pid )
           sleep 50
           kill $(cat /tmp/lldb.pid) 2>/dev/null || true
-          sleep 2
+          sleep 1
           echo "=== lldb.log ==="
-          grep -aE "PLATFORM_INT|CTX_60|BP_LOCS|THIS|HOOKERR|error:|wxime_initialize|cronet|wss" /tmp/lldb.log | head -40
-          echo "=== raw ==="
-          head -60 /tmp/lldb.log
+          cat /tmp/lldb.log | head -80
 
-      - name: Tokens
+      - name: Tokens / config
         if: always()
         run: |
-          ls -la "$HOME/Library/Application Support/WeType/business/ddd/2" 2>/dev/null || true
+          defaults read com.tencent.inputmethod.wetype 2>&1 | head -60 || true
+          echo "=== device code strings ==="
+          find "$HOME/Library/Application Support/WeType" -type f -size -2M 2>/dev/null | while read f; do strings "$f"; done | grep -aE "^(MAC|AND|WIN|IOS|HAR)[0-9A-Za-z]{20,}" | sort -u | head -10 || true
           tar -czf /tmp/appsupport.tgz -C "$HOME/Library/Application Support" WeType 2>/dev/null || true
 
       - name: Upload
